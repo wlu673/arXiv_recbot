@@ -34,6 +34,20 @@ User can also suggest papers by send its arXiv link in the chat window. Such pap
 
 User can also retrieve papers by sending `/get tag1 tag2 tag3` in the chat window, and the bot will retrieve all papers that contain the tags. 
 
+## Feishu (Lark) setup (optional)
+You can run the notifier in Feishu using a group bot webhook. This supports daily paper push notifications, but does not yet support interactive rating feedback or `/get` commands (Feishu interactive cards require a public callback endpoint).
+
+1. Create a Feishu group bot and obtain the webhook URL.
+2. Set these environment variables:
+```
+export FEISHU_BOT_WEBHOOK_URL="https://open.feishu.cn/open-apis/bot/v2/hook/..."
+export FEISHU_BOT_SECRET="your_optional_webhook_secret"
+```
+3. Run the bot in Feishu mode:
+```
+python arxiv_checker.py --channel feishu --first_backcheck_day 3 --keywords llm,search,reasoning,planning,optimization
+```
+
 ## Update the model. 
 Once the model collects enough ranking instances (e.g. > 100), user can update the preference model by running the following:
 ```
