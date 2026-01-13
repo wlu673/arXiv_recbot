@@ -1,10 +1,13 @@
+import argparse
 import os
+import random
+import time
+from datetime import datetime, timedelta, time as dt_time, UTC
+
+import joblib
 import numpy as np
 from sklearn.feature_extraction.text import TfidfVectorizer
 from sklearn.linear_model import LogisticRegression
-import joblib
-import random
-import argparse
 
 import torch
 import sqlite3
@@ -12,18 +15,15 @@ import sqlite3
 # Define your keywords
 MAX_RESULTS = 100
 
-# Telegram Bot Token and Chat ID (replace with your actual values)
-TELEGRAM_BOT_TOKEN = os.environ["TELEGRAM_BOT_TOKEN_NOTIF_BOT"]  # Set your Telegram bot token as an environment variable
-TELEGRAM_CHAT_ID = int(os.environ["TELEGRAM_BOT_CHAT_ID"]) # Replace with your chat ID
-
 import logging
-from datetime import datetime, timedelta, time, UTC
 from arxiv_util import *
 from preference_model import PreferenceModel
 from common import *
 
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import ApplicationBuilder, ContextTypes, CallbackQueryHandler, CommandHandler
+
+from feishu_client import send_feishu_text
 
 if os.path.exists(global_model_name):
     vectorizer = joblib.load(global_vectorizer_name)
@@ -46,13 +46,11 @@ application = None  # Will hold the Telegram application instance
 conn = sqlite3.connect(global_dataset_name)
 cursor = conn.cursor()
 
-async def fetch_and_send_papers(keywords, backdays, context: ContextTypes.DEFAULT_TYPE):
+def build_papers_to_send(keywords, backdays):
     results = get_arxiv_results(keywords.replace(",", " OR "), MAX_RESULTS)
 
     now = datetime.now(UTC)
     yesterday = now - timedelta(days=backdays)
-
-    num_sent = 0
 
     papers_to_send = []
 
@@ -85,15 +83,21 @@ async def fetch_and_send_papers(keywords, backdays, context: ContextTypes.DEFAUL
                 message = f"// no model yet\n{message}" 
 
             papers_to_send.append((overall_rating, message, result.entry_id))
-
     if len(papers_to_send) == 0:
-        await context.bot.send_message(chat_id=TELEGRAM_CHAT_ID, text="No new papers found.")
-        return
+        return []
 
     # Sort papers_to_send by overall_rating in descending order
     papers_to_send.sort(key=lambda x: x[0], reverse=True)
     # Select the top 10 papers
     papers_to_send = papers_to_send[:10]
+
+    return papers_to_send
+
+async def fetch_and_send_papers_telegram(keywords, backdays, context: ContextTypes.DEFAULT_TYPE, telegram_chat_id: int):
+    papers_to_send = build_papers_to_send(keywords, backdays)
+    if len(papers_to_send) == 0:
+        await context.bot.send_message(chat_id=telegram_chat_id, text="No new papers found.")
+        return
 
     for overall_rating, message, entry_id in papers_to_send:
         # Provide 5 level of rating for the paper.
@@ -107,9 +111,18 @@ async def fetch_and_send_papers(keywords, backdays, context: ContextTypes.DEFAUL
         reply_markup = InlineKeyboardMarkup(keyboard)
 
         try:
-            await context.bot.send_message(chat_id=TELEGRAM_CHAT_ID, text=message, parse_mode="Markdown", reply_markup=reply_markup)
+            await context.bot.send_message(chat_id=telegram_chat_id, text=message, parse_mode="Markdown", reply_markup=reply_markup)
         except Exception as e:
             print(e)
+
+def fetch_and_send_papers_feishu(keywords, backdays, webhook_url, webhook_secret):
+    papers_to_send = build_papers_to_send(keywords, backdays)
+    if len(papers_to_send) == 0:
+        send_feishu_text(webhook_url, "No new papers found.", webhook_secret)
+        return
+
+    for overall_rating, message, entry_id in papers_to_send:
+        send_feishu_text(webhook_url, message, webhook_secret)
 
 async def feedback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
@@ -164,24 +177,50 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument('--first_backcheck_day', type=int, default=None)
     parser.add_argument("--keywords", type=str, default="reasoning,planning,preference,optimization,symbolic,grokking")
+    parser.add_argument("--channel", type=str, default="telegram", choices=["telegram", "feishu"])
 
     args = parser.parse_args()
 
-    application = ApplicationBuilder().token(TELEGRAM_BOT_TOKEN).build()
+    if args.channel == "telegram":
+        telegram_bot_token = os.environ["TELEGRAM_BOT_TOKEN_NOTIF_BOT"]
+        telegram_chat_id = int(os.environ["TELEGRAM_BOT_CHAT_ID"])
 
-    application.add_handler(CallbackQueryHandler(feedback_handler))
-    application.add_handler(CommandHandler("get", retrieve_handler))
-    application.add_handler(CallbackQueryHandler(retrieve_handler, pattern="^get"))
+        application = ApplicationBuilder().token(telegram_bot_token).build()
 
-    run_once_fetch_func = lambda context: fetch_and_send_papers(args.keywords, args.first_backcheck_day, context)
-    run_daily_fetch_func = lambda context: fetch_and_send_papers(args.keywords, 2, context)
+        application.add_handler(CallbackQueryHandler(feedback_handler))
+        application.add_handler(CommandHandler("get", retrieve_handler))
+        application.add_handler(CallbackQueryHandler(retrieve_handler, pattern="^get"))
 
-    if args.first_backcheck_day is not None:
-        application.job_queue.run_once(run_once_fetch_func, when=timedelta(seconds=1))
-    application.job_queue.run_daily(run_daily_fetch_func, time(hour=15)) 
+        run_once_fetch_func = lambda context: fetch_and_send_papers_telegram(
+            args.keywords, args.first_backcheck_day, context, telegram_chat_id
+        )
+        run_daily_fetch_func = lambda context: fetch_and_send_papers_telegram(
+            args.keywords, 2, context, telegram_chat_id
+        )
 
-    # Run the bot
-    application.run_polling()
+        if args.first_backcheck_day is not None:
+            application.job_queue.run_once(run_once_fetch_func, when=timedelta(seconds=1))
+        application.job_queue.run_daily(run_daily_fetch_func, time=dt_time(hour=15))
+
+        # Run the bot
+        application.run_polling()
+    else:
+        webhook_url = os.environ["FEISHU_BOT_WEBHOOK_URL"]
+        webhook_secret = os.environ.get("FEISHU_BOT_SECRET")
+
+        if args.first_backcheck_day is not None:
+            fetch_and_send_papers_feishu(
+                args.keywords, args.first_backcheck_day, webhook_url, webhook_secret
+            )
+
+        while True:
+            now = datetime.now(UTC)
+            next_run = datetime.combine(now.date(), dt_time(hour=15), tzinfo=UTC)
+            if now >= next_run:
+                next_run += timedelta(days=1)
+            sleep_seconds = (next_run - now).total_seconds()
+            time.sleep(sleep_seconds)
+            fetch_and_send_papers_feishu(args.keywords, 2, webhook_url, webhook_secret)
 
 if __name__ == '__main__':
     main()
